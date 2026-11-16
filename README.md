@@ -1,5 +1,10 @@
 # Docker Homepage
 
+![CD - Build e push para o ECR](https://github.com/amoras200/Deploy-com-Docker-e-AWS/actions/workflows/cd-ecr.yml/badge.svg)
+
+## Objetivo
+Criar uma página inicial para o Docker, demonstrando seu uso e funcionalidades. Em seguida, fazer o deploy na AWS.
+
 ## Objetivo
 Criar uma página inicial para o Docker, demonstrando seu uso e funcionalidades. Em seguida, fazer o deploy na AWS.
 
@@ -132,3 +137,125 @@ Com tudo configurado, o container foi iniciado na instância EC2 e a página fic
 O deploy na AWS foi estruturado para usar EC2, ECR e IAM de forma integrada. Primeiro a página foi containerizada localmente, depois a imagem foi enviada ao ECR e, finalmente, a instância EC2 foi provisionada para executar o container Docker publicamente.
 
 Este fluxo garante que a aplicação esteja pronta para rodar na nuvem com controle de acesso e provisionamento seguro.
+
+## Continuous Delivery (Fase 1) — imagem no ECR
+
+Esta fase implementa **CD do artefato**: a cada push na `main` (ou disparo manual), o GitHub Actions faz build da imagem e publica no **Amazon ECR**. **Não é deploy automático na EC2** (isso seria uma Fase 2, ex.: atualizar o container via AWS SSM com a instância ativa).
+
+### Diagrama
+
+```text
+Commit (main) → GitHub Actions (workflow cd-ecr.yml)
+                      │  OIDC: AssumeRoleWithWebIdentity (sem chaves longas)
+                      ▼
+               Amazon ECR (aws_cd, us-east-1)
+                      │
+                      └─ tags: <commit-sha> e latest
+```
+
+### Pré-requisitos e configuração
+
+**Valores deste repositório**
+- Conta AWS: `385545779029`
+- Região: `us-east-1`
+- Repositório ECR: `aws_cd` (`385545779029.dkr.ecr.us-east-1.amazonaws.com/aws_cd`)
+- Repo GitHub: `amoras200/Deploy-com-Docker-e-AWS` (branch `main`)
+
+1. **Repositório no ECR (recriar se foi apagado)**
+   - Console AWS → ECR → *Create repository* (privado), nome `aws_cd`, região `us-east-1`.
+   - Via CLI (exemplo): `aws ecr create-repository --repository-name aws_cd --region us-east-1`
+
+2. **Provedor de identidade OIDC do GitHub no IAM** (uma vez por conta; reutilize se já existir)
+   - IAM → *Identity providers* → *Add provider* → tipo **OpenID Connect**.
+   - **Provider URL:** `https://token.actions.githubusercontent.com` (clique em *Get thumbprint* se solicitado pelo console).
+   - **Audience:** `sts.amazonaws.com`.
+   - Confirme que o provider criado aparece como `arn:aws:iam::385545779029:oidc-provider/token.actions.githubusercontent.com`.
+
+3. **Role IAM para o GitHub Actions assumir via OIDC (permissão mínima)**
+   - IAM → *Roles* → *Create role* → *Web identity*.
+   - Identity provider: `token.actions.githubusercontent.com`, Audience: `sts.amazonaws.com`.
+   - Restrinja ao repositório/branch (trust policy) — use a política abaixo (cobre execuções na ref `refs/heads/main`, incluindo push na `main`; `workflow_dispatch` deve ser disparado a partir da `main` para assumir a role com esta condição):
+
+   **Trust policy (colar/ajustar na role):**
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Federated": "arn:aws:iam::385545779029:oidc-provider/token.actions.githubusercontent.com"
+         },
+         "Action": "sts:AssumeRoleWithWebIdentity",
+         "Condition": {
+           "StringEquals": {
+             "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+             "token.actions.githubusercontent.com:sub": "repo:amoras200/Deploy-com-Docker-e-AWS:ref:refs/heads/main"
+           }
+         }
+       }
+     ]
+   }
+   ```
+
+   - Anexe uma política inline/gerenciada com permissão **apenas** para push no repo ECR `aws_cd`:
+
+   **Permission policy:**
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "ECRAuthToken",
+         "Effect": "Allow",
+         "Action": "ecr:GetAuthorizationToken",
+         "Resource": "*"
+       },
+       {
+         "Sid": "ECRPushPullRepo",
+         "Effect": "Allow",
+         "Action": [
+           "ecr:BatchCheckLayerAvailability",
+           "ecr:CompleteLayerUpload",
+           "ecr:InitiateLayerUpload",
+           "ecr:PutImage",
+           "ecr:UploadLayerPart",
+           "ecr:BatchGetImage",
+           "ecr:GetDownloadUrlForLayer"
+         ],
+         "Resource": "arn:aws:ecr:us-east-1:385545779029:repository/aws_cd"
+       }
+     ]
+   }
+   ```
+   - Copie o **ARN da role** (ex.: `arn:aws:iam::385545779029:role/<nome-da-role>`).
+
+4. **Configuração no GitHub (Settings do repositório)**
+   - *Settings → Secrets and variables → Actions*.
+   - **Secret:** `AWS_ROLE_ARN` = ARN da role criada.
+   - **Variables:** `AWS_REGION` = `us-east-1`, `ECR_REPOSITORY` = `aws_cd`.
+
+5. **Workflow**
+   - Arquivo: `.github/workflows/cd-ecr.yml` (gatilhos: push em `main` e `workflow_dispatch`; permissões `id-token: write`, `contents: read`; build com `context: ./docker-homepage` e push das tags `<sha>` e `latest`).
+   - Antes de confiar em produção, confirme as versões das actions na documentação oficial (`actions/checkout`, `aws-actions/configure-aws-credentials`, `aws-actions/amazon-ecr-login`, `docker/build-push-action`), pois podem mudar.
+
+### Como testar
+- Faça um commit pequeno na `main` e acompanhe a execução na aba **Actions**.
+- No ECR, confirme que aparecem as tags `<commit-sha>` e `latest`.
+- Puxe e rode localmente para validar a imagem:
+  ```bash
+  aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 385545779029.dkr.ecr.us-east-1.amazonaws.com
+  docker pull 385545779029.dkr.ecr.us-east-1.amazonaws.com/aws_cd:latest
+  docker run --rm -p 8080:80 385545779029.dkr.ecr.us-east-1.amazonaws.com/aws_cd:latest
+  ```
+- **Teste de falha (recomendado):** remova/restrinja temporariamente uma permissão da role (ex.: `ecr:PutImage`) e verifique o erro no workflow para entender falhas de autorização.
+
+### Fase 2 (opcional) — Deploy automático na EC2
+Para CD completo, seria necessário atualizar o container na EC2 (ex.: via **AWS Systems Manager/SSM**) após o push no ECR. Isso exige instância ligada, agente/permissões SSM e cuidado com custos; só considere "deploy automático" quando estiver funcionando de ponta a ponta.
+
+### Limpeza (evitar custos)
+- **ECR:** apagar imagens e, se não for mais usar, excluir o repositório `aws_cd`.
+- **IAM:** remover a role criada para o workflow e, se não houver outros usos, o provedor OIDC do GitHub na conta.
+- **EC2/recursos manuais:** encerrar instâncias e remover chaves/roles temporárias criadas nos testes anteriores.
+
+> **Segurança:** não versione chaves privadas (ex.: `.pem`). O repositório inclui `.gitignore` para `*.pem`; se algum arquivo sensível já foi commitado, remova do versionamento e rotacione a credencial. Evite commitar `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` — prefira OIDC como acima.

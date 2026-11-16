@@ -1,0 +1,14 @@
+# Secrets/keys
+*.pem
+*.key
+*.ppk
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local env
+.env
+.env.*
